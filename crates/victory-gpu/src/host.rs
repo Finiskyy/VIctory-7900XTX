@@ -38,7 +38,10 @@ const RTV_RING: u32 = 1024;
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
-    queue: ID3D12CommandQueue,
+    /// The queue everything of ours runs on. Taken through
+    /// [`Host::queue`], which keeps calls behind submissions handed off
+    /// ([`handoff`]); as it is only by that thread and for queries.
+    queue_raw: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
@@ -969,7 +972,7 @@ fn create() -> windows::core::Result<Host> {
         tracing::info!("host D3D12 device ready");
         Ok(Host {
             device,
-            queue,
+            queue_raw: queue,
             fence,
             submitted: Mutex::new(0),
             event,
@@ -3687,6 +3690,8 @@ fn late_line(frames: f64) {
 pub(crate) mod aside;
 pub(crate) mod awake;
 mod card_steps;
+mod handoff;
+pub(crate) use handoff::line as handoff_line;
 pub(crate) mod indirects;
 #[cfg(feature = "diagnostics")]
 mod panel;
@@ -4157,7 +4162,7 @@ impl Host {
         let mut state = clock.state.lock().unwrap_or_else(|e| e.into_inner());
         state.0 += 1;
         // SAFETY: our queue and the clock's fence.
-        let _ = unsafe { self.queue.Signal(&clock.fence, state.0) };
+        let _ = unsafe { self.queue().Signal(&clock.fence, state.0) };
         if let Some((since, worked_then)) = state.1.take() {
             CARD_CLOCK_US[0].fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
             CARD_CLOCK_US[1].fetch_add(worked().saturating_sub(worked_then), Ordering::Relaxed);
@@ -4257,6 +4262,9 @@ impl Host {
         if !crate::shadow::cards() {
             return None;
         }
+        // What goes up to the card's memory now goes behind the lists of
+        // submissions handed off, which read it as it was ([`handoff`]).
+        handoff::behind();
         // The ranges this submission's shaders may write, per copy.
         let declared: Vec<Declared> = declared.iter().filter(|(shadow, _)| shadow.carded()).cloned().collect();
         let declared = if crate::picked::lands() { crate::picked::with(declared, &picked.written) } else { declared };
@@ -4329,7 +4337,7 @@ impl Host {
                         // the copy queue; the sends come from there.
                         if looks.is_none() && upq::on() {
                             let (memory, used) = own.source();
-                            up = upq::send(self, &self.queue, &[(memory, 0, memory, used)], |_, _, _| {});
+                            up = upq::send(self, self.queue(), &[(memory, 0, memory, used)], |_, _, _| {});
                         }
                         let from = up.as_ref().and_then(upq::Slot::bounce);
                         own.record(self, list, &dirty, |shadow| looks.as_ref().is_some_and(|l| l.hold(shadow)), from);
@@ -4345,7 +4353,7 @@ impl Host {
                                 ranges.extend(rs.iter().map(|&(a, b)| (&shadow.buffer, a as u64, *staging, (b - a) as u64)));
                             }
                         }
-                        up = upq::send(self, &self.queue, &ranges, |i, bounce, at| {
+                        up = upq::send(self, self.queue(), &ranges, |i, bounce, at| {
                             let (card, offset, _, bytes) = ranges[i];
                             list.CopyBufferRegion(card, offset, bounce, at, bytes);
                         });
@@ -4414,7 +4422,7 @@ impl Host {
                         }
                     }
                     list.Close()?;
-                    self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                    self.queue().ExecuteCommandLists(&[Some(list.cast()?)]);
                     Ok(())
                 })()
             };
@@ -4784,11 +4792,11 @@ impl Host {
                 // In the order of the queue: the sends of title bytes so
                 // far are ahead of this fetch, every later one behind it.
                 let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
-                self.queue.ExecuteCommandLists(&lists);
+                self.queue().ExecuteCommandLists(&lists);
                 let after = *order;
                 drop(order);
                 self.card_sent();
-                self.queue.Signal(&fence, sent)?;
+                self.queue().Signal(&fence, sent)?;
                 meanwhile();
                 fence.SetEventOnCompletion(sent, event)?;
                 #[cfg(feature = "diagnostics")]
@@ -5075,10 +5083,10 @@ impl Host {
                         list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
                     }
                     list.Close()?;
-                    self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                    self.queue().ExecuteCommandLists(&[Some(list.cast()?)]);
                     self.card_sent();
                     *submitted += 1;
-                    self.queue.Signal(&self.fence, *submitted)?;
+                    self.queue().Signal(&self.fence, *submitted)?;
                     self.fence.SetEventOnCompletion(*submitted, self.event)?;
                     let was_working = working(false);
                     WaitForSingleObject(self.event, INFINITE);
@@ -5700,10 +5708,16 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         split.part(4);
         stage.next("submit: waiting for the heaps' records");
-        drop(heaps_synced);
-        // The slots that waited for a texture's host copy, before the
-        // lists that may read them run.
-        crate::descriptor::make_waiting();
+        // Sent ahead with [`handoff`]: the wait and what follows it are the
+        // thread's that sends, and this one goes on to the next submission.
+        let handing = late && handoff::on();
+        let mut heaps_synced = Some(heaps_synced);
+        if !handing {
+            drop(heaps_synced.take());
+            // The slots that waited for a texture's host copy, before the
+            // lists that may read them run.
+            crate::descriptor::make_waiting();
+        }
         #[cfg(feature = "diagnostics")]
         split.part(15);
         let prepared = std::time::Instant::now();
@@ -5728,22 +5742,39 @@ impl Host {
                 firsts.iter_mut().for_each(|first| *first += 1);
             }
             let cuts: Vec<usize> = parts.iter().filter_map(|&n| firsts.get(n).copied()).collect();
-            // SAFETY: closed lists; the fence is ours.
-            let signalled = unsafe {
-                let mut from = 0;
-                for to in cuts.into_iter().chain([lists.len()]) {
-                    self.queue.ExecuteCommandLists(&lists[from..to]);
-                    from = to;
+            if let Some(heaps) = heaps_synced.take() {
+                // (Before the flight joins the line: whoever finds it there
+                // and goes to the queue goes behind it.)
+                #[cfg(feature = "diagnostics")]
+                let _ = sending;
+                handoff::hand(handoff::Job {
+                    lists,
+                    cuts,
+                    value: *submitted,
+                    heaps,
+                    #[cfg(feature = "diagnostics")]
+                    stamp,
+                });
+                stage.next("submit: noting what is in the air");
+            } else {
+                // SAFETY: closed lists; the fence is ours.
+                let signalled = unsafe {
+                    let queue = self.queue();
+                    let mut from = 0;
+                    for to in cuts.into_iter().chain([lists.len()]) {
+                        queue.ExecuteCommandLists(&lists[from..to]);
+                        from = to;
+                    }
+                    queue.Signal(&self.fence, *submitted)
+                };
+                awake::sent(&self.device);
+                #[cfg(feature = "diagnostics")]
+                crate::timeline::sent(sending, *submitted, stamp);
+                self.card_sent();
+                stage.next("submit: noting what is in the air");
+                if let Err(e) = signalled {
+                    fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
                 }
-                self.queue.Signal(&self.fence, *submitted)
-            };
-            awake::sent(&self.device);
-            #[cfg(feature = "diagnostics")]
-            crate::timeline::sent(sending, *submitted, stamp);
-            self.card_sent();
-            stage.next("submit: noting what is in the air");
-            if let Err(e) = signalled {
-                fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
             #[cfg(feature = "diagnostics")]
             split.part(5);
@@ -5787,10 +5818,10 @@ impl Host {
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
-                self.queue.ExecuteCommandLists(group);
+                self.queue().ExecuteCommandLists(group);
                 self.card_sent();
                 let waited = self
-                    .queue
+                    .queue()
                     .Signal(&self.fence, *submitted)
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 #[cfg(feature = "diagnostics")]
@@ -5813,7 +5844,7 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             if timing() {
                 // SAFETY: a plain query.
-                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
+                let frequency = unsafe { self.queue_raw.GetTimestampFrequency() }.unwrap_or(1);
                 for (ms, op) in runs[i].slowest(frequency, usize::MAX) {
                     crate::copystat::command_took(&op, ms);
                 }
@@ -5824,7 +5855,7 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             if timing() && started.elapsed() > std::time::Duration::from_millis(50) {
                 // SAFETY: a plain query.
-                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
+                let frequency = unsafe { self.queue_raw.GetTimestampFrequency() }.unwrap_or(1);
                 let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
                 tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
                 for (ms, op) in runs[i].slowest(frequency, 6) {
@@ -8446,8 +8477,12 @@ impl Host {
     /// The queue everything of ours runs on, for a call that must go to it
     /// in order with the lists (`crate::tiles`: a texture's levels are
     /// given memory ahead of the list that uploads them).
+    ///
+    /// Behind every submission handed off ([`handoff`]): whatever goes to
+    /// the queue goes through this.
     pub(crate) fn queue(&self) -> &ID3D12CommandQueue {
-        &self.queue
+        handoff::behind();
+        &self.queue_raw
     }
 
     /// A buffer in the upload heap, mapped for writing.
@@ -9079,6 +9114,8 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
+            // Behind the copy just sent, which may have been handed off.
+            handoff::behind();
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]
@@ -9120,7 +9157,7 @@ impl Host {
                 ..Default::default()
             };
             let swap_chain = factory
-                .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
+                .CreateSwapChainForHwnd(self.queue(), hwnd, &desc, None, None)?
                 .cast::<IDXGISwapChain3>()?;
             let copy = self.new_list()?;
             copy.close();

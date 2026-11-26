@@ -83,7 +83,10 @@ in that order of size:
 
 1. The preparing thread: split what one submission does over two threads in a row; ask
    for the next submission while this one is sent; view the card's own buffers where fills
-   copy them now.
+   copy them now. First step, not measured yet: `VICTORY_SEND_THREAD=1` (off) gives the
+   wait for the heaps' records (6 ms) and the queue calls to a thread of their own while
+   the next submission is prepared; its frame line says what that thread and the waits
+   for it took.
 2. The card: small buffers' copies in its own memory (`VICTORY_CARD_BUFFERS_MIN_KB=64`,
    after fxceless c36971b2; not measured here yet), and the passes that run for nothing
    without rays.
