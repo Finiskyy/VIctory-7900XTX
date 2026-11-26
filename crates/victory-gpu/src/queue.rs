@@ -473,6 +473,7 @@ pub(crate) fn behind_line(frames: f64) {
         crate::list::thin::line(frames);
         behind::line(frames);
     }
+    crate::host::handoff_line(frames);
 }
 
 /// Whether a queue may pass `wait`: memory holds the value, or, with
